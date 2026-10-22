@@ -31,6 +31,11 @@ const SEVERITY_COLOR: Record<string, string> = {
 
 const TERMINAL = new Set(["done", "partial", "failed"]);
 
+// Deployed API base: set VITE_API_URL at build time (Vercel). In local dev
+// the Vite proxy forwards /api to the server on :4000, so this stays empty.
+const API_BASE = import.meta.env.VITE_API_URL ?? "";
+const api = (path: string) => `${API_BASE}${path}`;
+
 export default function App() {
   const [manifest, setManifest] = useState(
     '{\n  "dependencies": {\n    "lodash": "4.17.20",\n    "axios": "0.21.1",\n    "minimist": "1.2.5"\n  }\n}'
@@ -50,7 +55,7 @@ export default function App() {
       // Validate locally first so the server only ever sees JSON text.
       JSON.parse(manifest);
       // DESIGN contract: {manifest: string} → 202 {jobId}, then poll.
-      const res = await fetch("/api/scan", {
+      const res = await fetch(api("/api/scan"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ manifest }),
@@ -62,7 +67,7 @@ export default function App() {
       const { jobId } = await res.json();
       // Poll until a terminal status.
       for (;;) {
-        const poll = await fetch(`/api/scan/${jobId}`);
+        const poll = await fetch(api(`/api/scan/${jobId}`));
         if (!poll.ok) throw new Error(`poll HTTP ${poll.status}`);
         const data: ScanResult = await poll.json();
         setProgress(data.progress ?? 0);

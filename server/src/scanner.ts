@@ -5,7 +5,27 @@ import type { Dependency, Vulnerability } from "./types.js";
 import { FINDINGS_CAP } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const FIXTURES = join(__dirname, "..", "..", "fixtures");
+
+/**
+ * Locate the fixtures dir by walking up from the compiled module:
+ * - local dev / tests: server/dist (or server/src) -> repo root (vulnintel/fixtures)
+ * - Azure zip deploy: wwwroot/dist -> wwwroot/fixtures
+ * FIXTURES_DIR env var overrides (useful for custom deploy layouts).
+ */
+function fixturesDir(): string {
+  if (process.env.FIXTURES_DIR) return process.env.FIXTURES_DIR;
+  let dir = __dirname;
+  for (let i = 0; i < 5; i++) {
+    try {
+      readFileSync(join(dir, "fixtures", "vulns.json"), "utf-8");
+      return join(dir, "fixtures");
+    } catch {
+      dir = join(dir, "..");
+    }
+  }
+  return join(__dirname, "..", "..", "fixtures");
+}
+const FIXTURES = fixturesDir();
 
 /**
  * B-6 range semantics (kickoff decision, 2026-10-22):
