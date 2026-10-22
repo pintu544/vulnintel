@@ -222,6 +222,7 @@ export async function seedCuratedSubset(
 
   let osvRecords = 0;
   // querybatch accepts large batches; chunk defensively at 500.
+  const vulnIds = new Set<string>();
   for (let i = 0; i < queries.length; i += 500) {
     const chunk = queries.slice(i, i + 500);
     const res = await fetchFn("https://api.osv.dev/v1/querybatch", {
@@ -233,11 +234,26 @@ export async function seedCuratedSubset(
     if (!res.ok) {
       throw new Error(`osv querybatch: HTTP ${res.status}`);
     }
-    const data = (await res.json()) as { results?: { vulns?: Record<string, unknown>[] }[] };
+    const data = (await res.json()) as { results?: { vulns?: { id: string }[] }[] };
     for (const r of data.results ?? []) {
       for (const vuln of r.vulns ?? []) {
-        osvRecords += await upsertOsvVuln(pool, vuln);
+        if (vuln.id) vulnIds.add(vuln.id);
       }
+    }
+  }
+
+  // Hydrate each unique vuln (querybatch returns id+modified only).
+  // OSV has no rate limit; hydrate sequentially to stay polite.
+  for (const id of vulnIds) {
+    try {
+      const res = await fetchFn(`https://api.osv.dev/v1/vulns/${encodeURIComponent(id)}`, {
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) continue;
+      const vuln = (await res.json()) as Record<string, unknown>;
+      osvRecords += await upsertOsvVuln(pool, vuln);
+    } catch {
+      // One bad hydration must not kill the seed.
     }
   }
   return {

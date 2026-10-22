@@ -129,20 +129,63 @@ describe("curated seed", () => {
     expect(rec.affectedRanges).toEqual([{ introduced: "0.0.0", fixed: "4.17.21" }]);
   });
 
-  it("seedCuratedSubset upserts fixtures and is idempotent", async () => {
+  it("seedCuratedSubset upserts fixtures, hydrates OSV ids, and is idempotent", async () => {
     const { pool, statements } = fakePool();
     const fakeFetch = (async (url: string) => {
-      if (String(url).includes("registry.npmjs.org")) {
+      const u = String(url);
+      if (u.includes("registry.npmjs.org")) {
         return { ok: true, json: async () => ({ versions: { "1.0.0": {}, "2.0.0": {} } }) };
+      }
+      if (u.includes("/v1/querybatch")) {
+        return {
+          ok: true,
+          json: async () => ({ results: [{ vulns: [{ id: "GHSA-test-1" }] }] }),
+        };
+      }
+      if (u.includes("/v1/vulns/")) {
+        return {
+          ok: true,
+          json: async () => ({
+            id: "GHSA-test-1",
+            summary: "Test vuln",
+            severity: [{ type: "CVSS_V3", score: "7.5" }],
+            affected: [
+              {
+                package: { name: "lodash", ecosystem: "npm" },
+                ranges: [
+                  {
+                    type: "SEMVER",
+                    events: [{ introduced: "0" }, { fixed: "4.17.21" }],
+                  },
+                ],
+              },
+            ],
+          }),
+        };
       }
       return { ok: false, status: 500, json: async () => ({}) };
     }) as unknown as typeof fetch;
-    // OSV fetch fails -> seed throws after fixtures are upserted; fixtures still land.
+
+    const counts = await seedCuratedSubset(pool, loadFixtureVulns(), fakeFetch);
+    expect(counts.fixtures).toBe(3);
+    expect(counts.osvRecords).toBeGreaterThan(0);
+    const upserts = statements.filter((s) => s.text.includes("INSERT INTO vuln_records"));
+    // 3 fixture upserts + at least 1 hydrated OSV upsert; rerun upserts the same ids.
+    expect(upserts.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("seedCuratedSubset surfaces OSV failures visibly after fixtures land", async () => {
+    const { pool, statements } = fakePool();
+    const fakeFetch = (async (url: string) => {
+      if (String(url).includes("registry.npmjs.org")) {
+        return { ok: true, json: async () => ({ versions: { "1.0.0": {} } }) };
+      }
+      return { ok: false, status: 500, json: async () => ({}) };
+    }) as unknown as typeof fetch;
     await expect(
       seedCuratedSubset(pool, loadFixtureVulns(), fakeFetch)
     ).rejects.toThrow(/osv querybatch/);
     const upserts = statements.filter((s) => s.text.includes("INSERT INTO vuln_records"));
-    // 3 fixture upserts (one per fixture CVE) before the OSV failure.
     expect(upserts.length).toBe(3);
   });
 });
