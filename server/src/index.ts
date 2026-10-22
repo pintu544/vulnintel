@@ -1,9 +1,12 @@
 import express from "express";
 import cors from "cors";
 import { randomBytes, createHash } from "crypto";
+import { Pool } from "pg";
 import { parseManifest, loadFixtureVulns, matchVulns, rankFindings } from "./scanner.js";
 import { FINDINGS_CAP } from "./types.js";
 import type { ScanJob } from "./types.js";
+import { ensureSchema, seedCuratedSubset, type PoolLike } from "./fallbackDb.js";
+import { ZetarisAdapter } from "./zetaris.js";
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -132,6 +135,42 @@ app.get("/api/scan/:id", (req, res) => {
     inventory: job.inventory,
     error: job.error,
   });
+});
+
+// ---- Data-plane admin (build-window seeding; not part of the scan API) ----
+
+let _pool: Pool | null = null;
+function pool(): PoolLike {
+  if (!_pool) {
+    const url = process.env.DATABASE_URL;
+    if (!url) throw new Error("DATABASE_URL is not set");
+    _pool = new Pool({ connectionString: url, max: 3 });
+  }
+  return _pool as unknown as PoolLike;
+}
+
+/**
+ * POST /api/admin/seed — seed the curated fallback subset
+ * (fixture CVEs + top-package CVEs from OSV.dev; never full NVD).
+ * Protected by the ADMIN_KEY env var (header x-admin-key).
+ * The App Service has clean egress, so seeding runs here — the build VM's
+ * egress proxy breaks direct Postgres SSL.
+ */
+app.post("/api/admin/seed", async (req, res) => {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey || req.headers["x-admin-key"] !== adminKey) {
+    return res.status(adminKey ? 403 : 503).json({ error: "admin seeding is not enabled" });
+  }
+  try {
+    const p = pool();
+    await ensureSchema(p);
+    const counts = await seedCuratedSubset(p, loadFixtureVulns());
+    // Prime the Zetaris adapter state for the health check (no throw when unconfigured).
+    const zetaris = new ZetarisAdapter();
+    res.json({ ok: true, ...counts, zetarisConfigured: zetaris.isConfigured() });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
 });
 
 app.listen(PORT, () => {
