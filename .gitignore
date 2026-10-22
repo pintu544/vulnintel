@@ -1,0 +1,19 @@
+# deps
+node_modules/
+
+# builds
+dist/
+build/
+
+# env (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# logs
+*.log
