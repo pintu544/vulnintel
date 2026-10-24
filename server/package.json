@@ -10,13 +10,14 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "express": "^4.21.0",
+    "@brightdata/sdk": "^1.2.0",
     "cors": "^2.8.5",
+    "express": "^4.21.0",
     "pg": "^8.13.0"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
     "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
     "tsx": "^4.19.0",

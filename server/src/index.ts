@@ -1,12 +1,17 @@
 import express from "express";
 import cors from "cors";
 import { randomBytes, createHash } from "crypto";
+import { join } from "path";
 import { Pool } from "pg";
-import { parseManifest, loadFixtureVulns, matchVulns, rankFindings } from "./scanner.js";
+import { parseManifest, loadFixtureVulns, matchVulns, resolveFixturesDir } from "./scanner.js";
 import { FINDINGS_CAP } from "./types.js";
-import type { ScanJob, Vulnerability } from "./types.js";
+import type { ScanJob, Vulnerability, LiveIntelStatus } from "./types.js";
 import { queryOsvVulns, matchOsvVulns, osvToVulnerability } from "./osv.js";
 import { enrichWithNvd } from "./nvd.js";
+import { BrightDataClient } from "./brightdata.js";
+import { TriageMemory } from "./triage.js";
+import { embedCohere } from "./cohere.js";
+import { synthesizeRanking, OpenAiCompatibleClient } from "./ranking.js";
 import { ensureSchema, seedCuratedSubset, type PoolLike } from "./fallbackDb.js";
 import { ZetarisAdapter } from "./zetaris.js";
 
@@ -132,13 +137,121 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
       apiKey: process.env.NVD_API_KEY,
     });
     job.degradedNotes.push(...notes);
-    const ranked = rankFindings(enriched);
-    if (enriched.length > FINDINGS_CAP) {
+
+    // Slice 3, T-10: attach recalled triage decisions (seed fixture +
+    // POST /api/triage records). Semantic recall runs only when a Cohere
+    // key is configured; memory failures never fail a scan.
+    job.progress = 85;
+    const withTriage = [];
+    for (const v of enriched) {
+      try {
+        const recall = await triageMemory().recallWithSemantic(
+          v.package,
+          v.affectedVersions,
+          v.cwe,
+          v.description
+        );
+        withTriage.push({
+          ...v,
+          triageMemory: recall
+            ? {
+                signature: recall.decision.signature,
+                decision: recall.decision.decision,
+                rationale: recall.decision.rationale,
+                match: recall.match,
+              }
+            : undefined,
+        });
+      } catch {
+        withTriage.push({ ...v });
+      }
+    }
+
+    // Slice 3, T-9: Bright Data live intel for the top 5 findings only
+    // (1 credit per SERP call; the cap is named, never silent). One client
+    // per scan job, closed after. Unconfigured or failed intel is a named
+    // degradation, never a silent gap (FR-10).
+    job.progress = 90;
+    const INTEL_TOP_N = 5;
+    const bdToken = process.env.BRIGHTDATA_API_TOKEN;
+    let withIntel: Array<(typeof withTriage)[number] & { liveIntelStatus: LiveIntelStatus; liveIntelExcerpts?: string[] }> =
+      withTriage.map((v) => ({ ...v, liveIntelStatus: "not checked" as LiveIntelStatus }));
+    if (!bdToken) {
+      withIntel = withTriage.map((v) => ({ ...v, liveIntelStatus: "unavailable" as LiveIntelStatus }));
+      job.degradedNotes.push("Bright Data not configured; live intel unavailable");
+    } else {
+      const bd = new BrightDataClient({
+        apiKey: bdToken,
+      });
+      try {
+        const order = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 } as const;
+        const top = [...withTriage]
+          .sort((a, b) => order[b.severity] - order[a.severity] || b.cvss - a.cvss)
+          .slice(0, INTEL_TOP_N);
+        withIntel = withTriage.map((v) => ({
+          ...v,
+          liveIntelStatus: "not checked" as LiveIntelStatus,
+        }));
+        for (const t of top) {
+          try {
+            const intel = await bd.serpExploitIntel(t.id);
+            const key = `${t.package}@${t.id}`;
+            const idx = withIntel.findIndex((v) => `${v.package}@${v.id}` === key);
+            if (idx >= 0) {
+              withIntel[idx] = {
+                ...withIntel[idx],
+                liveIntelStatus: intel.hits.length > 0 ? "found" : "no live intel found",
+                liveIntelExcerpts: intel.hits.map((h) => `${h.title} — ${h.snippet}`.trim()),
+              };
+            }
+          } catch {
+            const key = `${t.package}@${t.id}`;
+            const idx = withIntel.findIndex((v) => `${v.package}@${v.id}` === key);
+            if (idx >= 0) withIntel[idx] = { ...withIntel[idx], liveIntelStatus: "unavailable" };
+          }
+        }
+        job.liveIntelCredits = bd.creditsUsed;
+        if (withTriage.length > INTEL_TOP_N) {
+          job.degradedNotes.push(
+            `live intel checked for top ${INTEL_TOP_N} findings only (credit discipline); rest marked "not checked"`
+          );
+        }
+      } catch (e) {
+        job.degradedNotes.push(
+          `Bright Data intel unavailable (${e instanceof Error ? e.message : String(e)})`
+        );
+      } finally {
+        await bd.close();
+      }
+    }
+
+    // Slice 3, T-11: deterministic ranking + optional LLM evidence summaries.
+    // Order never depends on the LLM; failure degrades to summaries-omitted.
+    job.progress = 95;
+    const llmKey = process.env.LLM_API_KEY ?? process.env.NVIDIA_API_KEY;
+    const llm = llmKey
+      ? new OpenAiCompatibleClient({
+          baseUrl: process.env.LLM_BASE_URL ?? "https://integrate.api.nvidia.com/v1",
+          apiKey: llmKey,
+          model: process.env.LLM_MODEL ?? "nvidia/llama-3.1-nemotron-70b-instruct",
+        })
+      : undefined;
+    const fallbackKey = process.env.LLM_FALLBACK_API_KEY ?? process.env.FASTROUTER_API_KEY1;
+    const fallbackLlm = fallbackKey
+      ? new OpenAiCompatibleClient({
+          baseUrl: process.env.LLM_FALLBACK_BASE_URL ?? "https://go.fastrouter.ai/api/v1",
+          apiKey: fallbackKey,
+          model: process.env.LLM_FALLBACK_MODEL ?? "openai/gpt-5.2",
+        })
+      : undefined;
+    const { ranked, notes: rankNotes } = await synthesizeRanking(withIntel, { llm, fallbackLlm });
+    job.degradedNotes.push(...rankNotes);
+    if (ranked.length > FINDINGS_CAP) {
       job.degradedNotes.push(
-        `${enriched.length} findings matched; returning top ${FINDINGS_CAP} by score`
+        `${ranked.length} findings matched; returning top ${FINDINGS_CAP} by score`
       );
     }
-    job.findings = ranked;
+    job.findings = ranked.slice(0, FINDINGS_CAP);
     job.progress = 100;
     job.status = job.degradedNotes.length > 0 ? "partial" : "done";
   } catch (e) {
@@ -151,7 +264,7 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
 
 /**
  * GET /api/scan/:id — poll job state.
- * Response: {id, status, progress, findings?, degradedNotes[], inventory?, error?}
+ * Response: {id, status, progress, findings?, degradedNotes[], inventory?, error?, liveIntelCredits?}
  */
 app.get("/api/scan/:id", (req, res) => {
   const job = jobs.get(req.params.id);
@@ -164,7 +277,54 @@ app.get("/api/scan/:id", (req, res) => {
     degradedNotes: job.degradedNotes,
     inventory: job.inventory,
     error: job.error,
+    liveIntelCredits: job.liveIntelCredits,
   });
+});
+
+// ---- Triage memory (Slice 3, T-10) ----
+
+let _triage: TriageMemory | null = null;
+
+/** Singleton triage memory, seeded from fixtures/triage-memory.json at boot.
+ * Semantic recall is wired only when a Cohere key is configured. */
+function triageMemory(): TriageMemory {
+  if (!_triage) {
+    const cohereKey = process.env.COHERE_API_KEY1;
+    _triage = new TriageMemory({
+      storePath: process.env.TRIAGE_STORE_PATH || undefined,
+      embedder: cohereKey
+        ? (texts, inputType) => embedCohere(texts, { apiKey: cohereKey, inputType })
+        : undefined,
+    });
+    _triage.seedFromFile(join(resolveFixturesDir(), "triage-memory.json"));
+  }
+  return _triage;
+}
+
+/**
+ * POST /api/triage — record a triage decision (DESIGN contract).
+ * Body: {signature: string, decision: fix-now|defer|ignore, rationale?: string}
+ * Upserts by signature; a later rescan surfaces it on similar findings.
+ */
+app.post("/api/triage", (req, res) => {
+  const { signature, decision, rationale } = req.body ?? {};
+  if (typeof signature !== "string" || signature.trim() === "") {
+    return res.status(400).json({ error: "signature must be a non-empty string" });
+  }
+  if (decision !== "fix-now" && decision !== "defer" && decision !== "ignore") {
+    return res.status(400).json({ error: "decision must be fix-now|defer|ignore" });
+  }
+  if (rationale !== undefined && typeof rationale !== "string") {
+    return res.status(400).json({ error: "rationale must be a string" });
+  }
+  triageMemory().add({
+    signature,
+    decision,
+    rationale: rationale ?? "",
+    createdAt: new Date().toISOString(),
+    source: "api",
+  });
+  res.json({ ok: true });
 });
 
 // ---- Data-plane admin (build-window seeding; not part of the scan API) ----

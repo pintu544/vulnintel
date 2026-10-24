@@ -27,6 +27,11 @@ function fixturesDir(): string {
 }
 const FIXTURES = fixturesDir();
 
+/** Fixtures dir resolved by the walk-up above (shared with triage seeding). */
+export function resolveFixturesDir(): string {
+  return FIXTURES;
+}
+
 /**
  * B-6 range semantics (kickoff decision, 2026-10-22):
  * A bare semver range is RESOLVED to an exact version BEFORE any matching —
