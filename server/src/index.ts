@@ -4,7 +4,9 @@ import { randomBytes, createHash } from "crypto";
 import { Pool } from "pg";
 import { parseManifest, loadFixtureVulns, matchVulns, rankFindings } from "./scanner.js";
 import { FINDINGS_CAP } from "./types.js";
-import type { ScanJob } from "./types.js";
+import type { ScanJob, Vulnerability } from "./types.js";
+import { queryOsvVulns, matchOsvVulns, osvToVulnerability } from "./osv.js";
+import { enrichWithNvd } from "./nvd.js";
 import { ensureSchema, seedCuratedSubset, type PoolLike } from "./fallbackDb.js";
 import { ZetarisAdapter } from "./zetaris.js";
 
@@ -81,6 +83,7 @@ app.post("/api/scan", (req, res) => {
 });
 
 function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
+  void (async () => {
   try {
     job.status = "running";
     job.progress = 10;
@@ -97,16 +100,42 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
       );
     }
 
-    // Slice 1: fixture-backed matching. T-7 swaps in OSV querybatch behind
-    // the same function boundary; T-8 adds NVD enrichment.
-    const vulns = loadFixtureVulns();
+    // Slice 2: live OSV querybatch matching (T-7) + NVD enrichment (T-8).
+    // Fixtures remain as fallback when OSV is unreachable — named in
+    // degradedNotes, never a silent gap (FR-10).
     job.progress = 55;
-    const matches = matchVulns(inventory, vulns);
-    job.progress = 80;
-    const ranked = rankFindings(matches);
-    if (matches.length > FINDINGS_CAP) {
+    let matches: Vulnerability[];
+    try {
+      const { vulns, hydrateFailures, hydrationCapped } =
+        await queryOsvVulns(inventory);
+      if (hydrateFailures > 0) {
+        job.degradedNotes.push(
+          `OSV detail hydration failed for ${hydrateFailures} record(s); results may be incomplete`
+        );
+      }
+      if (hydrationCapped) {
+        job.degradedNotes.push(
+          "OSV hydration capped; results may be incomplete"
+        );
+      }
+      matches = matchOsvVulns(inventory, vulns).map(osvToVulnerability);
+    } catch (e) {
       job.degradedNotes.push(
-        `${matches.length} findings matched; returning top ${FINDINGS_CAP} by score`
+        `live OSV unavailable (${e instanceof Error ? e.message : String(e)}); fixture fallback used`
+      );
+      matches = matchVulns(inventory, loadFixtureVulns());
+    }
+    job.progress = 80;
+    // NVD enrichment is best-effort: keyed (50 req/30s) when NVD_API_KEY is
+    // set, keyless (5 req/30s) otherwise; failures are noted, never fatal.
+    const { enriched, notes } = await enrichWithNvd(matches, {
+      apiKey: process.env.NVD_API_KEY,
+    });
+    job.degradedNotes.push(...notes);
+    const ranked = rankFindings(enriched);
+    if (enriched.length > FINDINGS_CAP) {
+      job.degradedNotes.push(
+        `${enriched.length} findings matched; returning top ${FINDINGS_CAP} by score`
       );
     }
     job.findings = ranked;
@@ -117,6 +146,7 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
     job.error = String(e);
     job.progress = 100;
   }
+  })();
 }
 
 /**
