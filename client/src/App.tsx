@@ -10,6 +10,18 @@ interface Finding {
   rank: number;
   score: number;
   evidence: { source: string; detail: string }[];
+  // Slice 3 fields (all ride on the scan response; none reorders ranks).
+  evidenceSummary?: string;
+  liveIntelStatus?: string;
+  liveIntelExcerpts?: string[];
+  triageMemory?: {
+    signature: string;
+    decision: string;
+    rationale: string;
+    match: string;
+  };
+  exploitability?: number;
+  reachability?: number;
 }
 
 interface ScanResult {
@@ -20,6 +32,7 @@ interface ScanResult {
   findings?: Finding[];
   degradedNotes?: string[];
   error?: string;
+  liveIntelCredits?: number;
 }
 
 const SEVERITY_COLOR: Record<string, string> = {
@@ -65,10 +78,25 @@ export default function App() {
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
       const { jobId } = await res.json();
-      // Poll until a terminal status.
+      // Poll until a terminal status. A vanished job (server restart wipes
+      // the in-memory store) 404s: retry once after a short wait, then say
+      // so plainly instead of looping forever. 10 min overall guard.
+      const deadline = Date.now() + 10 * 60 * 1000;
+      let retried404 = false;
       for (;;) {
+        if (Date.now() > deadline) throw new Error("scan timed out after 10 minutes");
         const poll = await fetch(api(`/api/scan/${jobId}`));
-        if (!poll.ok) throw new Error(`poll HTTP ${poll.status}`);
+        if (!poll.ok) {
+          if (poll.status === 404 && !retried404) {
+            retried404 = true;
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+          if (poll.status === 404) {
+            throw new Error("scan was lost on the server (restart); please rescan");
+          }
+          throw new Error(`poll HTTP ${poll.status}`);
+        }
         const data: ScanResult = await poll.json();
         setProgress(data.progress ?? 0);
         if (TERMINAL.has(data.status)) {
@@ -104,6 +132,20 @@ export default function App() {
         rows={8}
         className="w-full font-mono text-sm p-3 border rounded mt-2"
       />
+      <div className="mt-2 text-sm text-neutral-500">
+        or upload a package.json:{" "}
+        <input
+          type="file"
+          accept=".json,application/json"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => setManifest(String(reader.result ?? ""));
+            reader.readAsText(file);
+          }}
+        />
+      </div>
       <br />
       <button
         onClick={runScan}
@@ -129,6 +171,11 @@ export default function App() {
             {result.inventory && (
               <span className="font-normal text-neutral-500 text-sm">
                 {" "}— {result.inventory.length} dependencies scanned
+              </span>
+            )}
+            {result.liveIntelCredits !== undefined && (
+              <span className="font-normal text-neutral-500 text-sm">
+                {" "}· live intel credits used: {result.liveIntelCredits}
               </span>
             )}
           </h3>
@@ -176,18 +223,49 @@ export default function App() {
                 </span>
               </div>
               <p className="mt-2 text-neutral-700">{f.description}</p>
+              {f.evidenceSummary && (
+                <p className="mt-2 text-sm text-neutral-700">
+                  <strong>AI summary:</strong> {f.evidenceSummary}
+                </p>
+              )}
               {expanded.has(i) && (
                 <div className="mt-3 pt-3 border-t border-neutral-100">
                   <strong>Why this ranks #{f.rank}:</strong>
                   <ul className="my-2">
-                    {f.evidence.map((e, j) => (
+                    {(f.evidence ?? []).map((e, j) => (
                       <li key={j} className="text-sm text-neutral-600">
                         <strong>{e.source}:</strong> {e.detail}
                       </li>
                     ))}
                   </ul>
-                  <div className="text-xs text-neutral-500">
+                  {f.liveIntelStatus && (
+                    <p className="text-sm text-neutral-600 mt-2">
+                      <strong>Live intel:</strong> {f.liveIntelStatus}
+                      {f.liveIntelStatus === "not checked" &&
+                        " (top-5 findings per scan only)"}
+                    </p>
+                  )}
+                  {(f.liveIntelExcerpts?.length ?? 0) > 0 && (
+                    <ul className="my-2">
+                      {f.liveIntelExcerpts!.map((ex, j) => (
+                        <li key={j} className="text-sm text-neutral-600">
+                          {ex}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {f.triageMemory && (
+                    <p className="text-sm text-neutral-600 mt-2">
+                      <strong>Triage memory ({f.triageMemory.match}):</strong>{" "}
+                      {f.triageMemory.decision} — {f.triageMemory.rationale}
+                    </p>
+                  )}
+                  <div className="text-xs text-neutral-500 mt-2">
                     CWE: {f.cwe} · Score: {f.score.toFixed(1)}
+                    {f.exploitability !== undefined &&
+                      ` · Exploitability: ${f.exploitability.toFixed(2)}`}
+                    {f.reachability !== undefined &&
+                      ` · Reachability: ${f.reachability.toFixed(2)}`}
                   </div>
                 </div>
               )}
