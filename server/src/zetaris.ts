@@ -13,8 +13,10 @@
  * agent harness speaks MCP regardless of whether Zetaris's official MCP
  * server materialises — per DESIGN's "thin in-harness MCP adapter" decision.
  * When Zetaris is unreachable/unconfigured, callers fall back to the direct-
- * Postgres functions in fallbackDb.ts and surface a "federation degraded"
- * note (FR-4, FR-10).
+ * Postgres functions in fallbackDb.ts. No caller currently surfaces a
+ * "federation degraded" note: the scan path never calls Zetaris, and
+ * admin-seed only reports the configured flag — the adapter is
+ * adapter-ready, not scan-integrated (QA m7).
  */
 
 import { randomUUID } from "crypto";

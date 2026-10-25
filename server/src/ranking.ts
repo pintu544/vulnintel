@@ -253,6 +253,11 @@ export async function synthesizeRanking(
     } else {
       notes.push("LLM ranking synthesis unavailable (primary and fallback failed); deterministic ranking used");
     }
+  } else {
+    // S5, D2: no LLM configured at all is a named degradation, not a
+    // silent omission — local keyless runs previously dropped summaries
+    // with no note anywhere.
+    notes.push("LLM not configured; summaries omitted");
   }
 
   return { ranked, notes, llmUsed };

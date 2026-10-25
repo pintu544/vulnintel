@@ -150,7 +150,14 @@ export async function enrichWithNvd(
         continue;
       }
       if (!res.ok) return null;
-      return (await res.json()) as Record<string, unknown>;
+      // QA M1: res.json() used to sit outside the try — a malformed 200
+      // escaped enrichment and failed the whole scan. A bad body is now
+      // exactly like a failed fetch: null → per-record note, scan continues.
+      try {
+        return (await res.json()) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
     }
   }
 

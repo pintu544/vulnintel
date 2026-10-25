@@ -128,12 +128,12 @@ describe("LLM summaries", () => {
     expect(fallback.chat).toHaveBeenCalledTimes(1);
   });
 
-  it("no LLM configured means deterministic only, no note", async () => {
+  it("no LLM configured means deterministic only, with a named note (S5, D2)", async () => {
     const { ranked, llmUsed, notes } = await synthesizeRanking([
       finding({ id: "CVE-A", severity: "HIGH", cvss: 7.2 }),
     ]);
     expect(llmUsed).toBe(false);
-    expect(notes).toEqual([]);
+    expect(notes).toEqual(["LLM not configured; summaries omitted"]);
     expect(ranked[0].rank).toBe(1);
   });
 });

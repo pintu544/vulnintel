@@ -1,4 +1,5 @@
 import express from "express";
+import type { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import { randomBytes, createHash } from "crypto";
 import { join } from "path";
@@ -21,15 +22,40 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+// S5, D3: over-limit bodies must surface as a readable JSON error, not
+// Express's default HTML 413 (the client shows body.error, else bare status).
+app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (err && typeof err === "object" && (err as { type?: string }).type === "entity.too.large") {
+    return res.status(413).json({ error: "manifest exceeds the 1mb body limit" });
+  }
+  // QA m5: malformed JSON bodies used to get Express's default HTML 400
+  // (client shows bare "HTTP 400"). Same JSON-error treatment as 413.
+  if (err && typeof err === "object" && (err as { type?: string }).type === "entity.parse.failed") {
+    return res.status(400).json({ error: "request body is not valid JSON" });
+  }
+  return next(err);
+});
+
 const jobs = new Map<string, ScanJob>();
 
 /**
- * GET /api/health — liveness probe.
- * T-2 ships the simple shape; the DESIGN contract shape
- * ({ok, zetaris, brightdata, llm}) lands by T-13 fault-injection.
+ * GET /api/health — liveness probe + DESIGN contract component flags (T-13).
+ * Flags only, no live calls: a Bright Data ping would burn a credit, and
+ * no key material ever appears in the response. `ok` stays first for
+ * existing consumers (deploy checks assert HTTP 200 + ok).
  */
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "vulnintel-server", version: "0.1.0" });
+  res.json({
+    ok: true,
+    service: "vulnintel-server",
+    version: "0.1.0",
+    zetaris: { configured: new ZetarisAdapter().isConfigured() },
+    brightdata: { configured: Boolean(process.env.BRIGHTDATA_API_TOKEN) },
+    llm: {
+      primary: Boolean(process.env.LLM_API_KEY ?? process.env.NVIDIA_API_KEY),
+      fallback: Boolean(process.env.LLM_FALLBACK_API_KEY ?? process.env.FASTROUTER_API_KEY1),
+    },
+  });
 });
 
 /**
@@ -128,7 +154,14 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
       job.degradedNotes.push(
         `live OSV unavailable (${e instanceof Error ? e.message : String(e)}); fixture fallback used`
       );
-      matches = matchVulns(inventory, loadFixtureVulns());
+      // QA m6: a missing fixtures file used to leak its path into
+      // job.error via the outer catch. The double fault now fails with a
+      // clean message (no paths, no key material).
+      try {
+        matches = matchVulns(inventory, loadFixtureVulns());
+      } catch {
+        throw new Error("fixture fallback data unavailable (OSV unreachable)");
+      }
     }
     job.progress = 80;
     // NVD enrichment is best-effort: keyed (50 req/30s) when NVD_API_KEY is
@@ -143,6 +176,10 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
     // key is configured; memory failures never fail a scan.
     job.progress = 85;
     const withTriage = [];
+    // QA m1: recall failures used to vanish per finding with no note.
+    // Sync exact/package-class recall cannot realistically throw, so a
+    // throw here is a memory-recall failure — counted and named below.
+    let recallFailures = 0;
     for (const v of enriched) {
       try {
         const recall = await triageMemory().recallWithSemantic(
@@ -163,8 +200,14 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
             : undefined,
         });
       } catch {
+        recallFailures++;
         withTriage.push({ ...v });
       }
+    }
+    if (recallFailures > 0) {
+      job.degradedNotes.push(
+        `triage memory recall failed for ${recallFailures} finding(s); those findings shown without triage advice`
+      );
     }
 
     // Slice 3, T-9: Bright Data live intel for the top 5 findings only
@@ -192,6 +235,7 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
           ...v,
           liveIntelStatus: "not checked" as LiveIntelStatus,
         }));
+        let intelFailures = 0;
         for (const t of top) {
           try {
             const intel = await bd.serpExploitIntel(t.id);
@@ -205,10 +249,18 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
               };
             }
           } catch {
+            // S5: a failed intel call is a named job-level degradation, not
+            // just a per-finding status — the banner must say so (FR-10).
+            intelFailures++;
             const key = `${t.package}@${t.id}`;
             const idx = withIntel.findIndex((v) => `${v.package}@${v.id}` === key);
             if (idx >= 0) withIntel[idx] = { ...withIntel[idx], liveIntelStatus: "unavailable" };
           }
+        }
+        if (intelFailures > 0) {
+          job.degradedNotes.push(
+            `Bright Data intel unavailable for ${intelFailures} of ${top.length} checked findings; those findings marked unavailable`
+          );
         }
         job.liveIntelCredits = bd.creditsUsed;
         if (withTriage.length > INTEL_TOP_N) {
@@ -221,7 +273,9 @@ function runScanJob(job: ScanJob, manifest: Record<string, unknown>) {
           `Bright Data intel unavailable (${e instanceof Error ? e.message : String(e)})`
         );
       } finally {
-        await bd.close();
+        // QA m4: a throwing close() used to convert a good scan to
+        // failed. Close is best-effort; the scan result stands either way.
+        await bd.close().catch(() => {});
       }
     }
 
@@ -305,8 +359,18 @@ function triageMemory(): TriageMemory {
  * POST /api/triage — record a triage decision (DESIGN contract).
  * Body: {signature: string, decision: fix-now|defer|ignore, rationale?: string}
  * Upserts by signature; a later rescan surfaces it on similar findings.
+ *
+ * QA M3: triage memory is shared mutable state, so recording is gated
+ * behind ADMIN_KEY like /api/admin/seed. The demo UI never calls this
+ * endpoint (it only reads triageMemory from scan findings), so gating it
+ * changes no user flow. /api/scan stays open by design (public demo);
+ * the residual credit exposure is disclosed in the submission write-up.
  */
 app.post("/api/triage", (req, res) => {
+  const adminKey = process.env.ADMIN_KEY;
+  if (!adminKey || req.headers["x-admin-key"] !== adminKey) {
+    return res.status(adminKey ? 403 : 503).json({ error: "triage recording requires an admin key" });
+  }
   const { signature, decision, rationale } = req.body ?? {};
   if (typeof signature !== "string" || signature.trim() === "") {
     return res.status(400).json({ error: "signature must be a non-empty string" });
