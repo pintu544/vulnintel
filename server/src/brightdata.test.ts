@@ -47,6 +47,36 @@ describe("parseSerpHits", () => {
       { title: "T", link: "https://x", snippet: "S" },
     ]);
   });
+
+  it("unwraps the live /request wrapper whose body is a JSON string", () => {
+    const wrapper = {
+      status_code: 200,
+      headers: {},
+      body: JSON.stringify({
+        general: { results_cnt: 9, query: "CVE-2021-23337 exploit vulnerability" },
+        organic: [
+          { title: "CVE-2021-23337", link: "https://example.com/cve-2021-23337", description: "Command injection flaw." },
+        ],
+      }),
+    };
+    expect(parseSerpHits(wrapper)).toEqual([
+      { title: "CVE-2021-23337", link: "https://example.com/cve-2021-23337", snippet: "Command injection flaw." },
+    ]);
+  });
+
+  it("unwraps a fully stringified wrapper", () => {
+    const wrapper = JSON.stringify({
+      status_code: 200,
+      body: JSON.stringify({
+        organic: [{ title: "T", link: "https://x", description: "D" }],
+      }),
+    });
+    expect(parseSerpHits(wrapper)).toEqual([{ title: "T", link: "https://x", snippet: "D" }]);
+  });
+
+  it("returns empty for an unparseable body string", () => {
+    expect(parseSerpHits({ status_code: 200, body: "not json {" })).toEqual([]);
+  });
 });
 
 describe("BrightDataClient (SDK shape)", () => {

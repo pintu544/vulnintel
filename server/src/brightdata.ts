@@ -58,12 +58,31 @@ export interface BrightDataSdkLike {
   close: () => Promise<unknown> | unknown;
 }
 
-/** Parse SDK SERP output tolerantly: array of hits, or {organic|results}. */
+/** Parse a value that may be a JSON string; unparseable strings yield undefined. */
+function tryParseJson(data: unknown): unknown {
+  if (typeof data !== "string") return data;
+  try {
+    return JSON.parse(data);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Parse SDK SERP output tolerantly. The live /request API wraps the page JSON
+ * as {status_code, headers, body} where body is a STRING of the SERP JSON
+ * (verified live 2026-10-24: the string parses to {general, organic, ...}),
+ * so both the wrapper and its string body must be unwrapped before hits can
+ * be extracted — without this the parser silently returned [] for every live
+ * query. Accepted shapes: array of hits, or {organic|results} at the top
+ * level or inside a (possibly string) body.
+ */
 export function parseSerpHits(data: unknown): SerpHit[] {
-  const root = data as Record<string, unknown> | null;
-  const arr = Array.isArray(data)
-    ? data
-    : ((root?.organic ?? root?.results ?? (root?.body as Record<string, unknown> | undefined)?.organic) as unknown[]);
+  const root = tryParseJson(data) as Record<string, unknown> | null;
+  const body = tryParseJson(root?.body) as Record<string, unknown> | undefined;
+  const arr = Array.isArray(root)
+    ? root
+    : ((root?.organic ?? root?.results ?? body?.organic ?? body?.results) as unknown[]);
   if (!Array.isArray(arr)) return [];
   return arr
     .slice(0, 5)
